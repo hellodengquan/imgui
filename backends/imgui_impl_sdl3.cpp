@@ -424,11 +424,23 @@ bool ImGui_ImplSDL3_ProcessEvent(const SDL_Event* event)
             bd->MouseButtonsDown = (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) ? (bd->MouseButtonsDown | (1 << mouse_button)) : (bd->MouseButtonsDown & ~(1 << mouse_button));
             return true;
         }
+        case SDL_EVENT_TEXT_EDITING:
+        {
+            if (ImGui_ImplSDL3_GetViewportForWindowID(event->edit.windowID) == nullptr)
+                return false;
+            // SDL reports the marked-text selection in UTF-8 byte offsets; an empty editing text
+            // means the input method discarded the composition.
+            if (event->edit.text != NULL && event->edit.text[0] != 0)
+                io.AddImeCompositionEvent(event->edit.text, (int)event->edit.start, (int)event->edit.length);
+            else
+                io.AddImeCancelEvent();
+            return true;
+        }
         case SDL_EVENT_TEXT_INPUT:
         {
             if (ImGui_ImplSDL3_GetViewportForWindowID(event->text.windowID) == nullptr)
                 return false;
-            io.AddInputCharactersUTF8(event->text.text);
+            io.AddImeCommitEvent(event->text.text);
             return true;
         }
         case SDL_EVENT_KEY_DOWN:

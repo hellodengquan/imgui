@@ -4377,6 +4377,26 @@ static void stb_textedit_replace(ImGuiInputTextState* str, STB_TexteditState* st
     IM_ASSERT(0); // Failed to insert character, normally shouldn't happen because of how we currently use stb_textedit_replace()
 }
 
+// Replace the current selection (or the character at cursor when nothing is selected) with 'text'
+// while producing exactly ONE undo record, so an IME commit is undone as a single selection replacement.
+static void stb_textedit_ime_commit(ImGuiInputTextState* str, STB_TexteditState* state, const char* text, int text_len)
+{
+    stb_textedit_clamp(str, state);
+    const int sel_start = ImMin(state->select_start, state->select_end);
+    const int sel_end   = ImMax(state->select_start, state->select_end);
+    const int old_len   = sel_end - sel_start;
+
+    // One replace record captures both the deleted selection and the inserted text.
+    stb_text_makeundo_replace(str, state, sel_start, old_len, text_len);
+    if (old_len > 0)
+        ImStb::STB_TEXTEDIT_DELETECHARS(str, sel_start, old_len);
+    int inserted = 0;
+    if (text_len > 0)
+        inserted = ImStb::STB_TEXTEDIT_INSERTCHARS(str, sel_start, text, text_len);
+    state->cursor = state->select_start = state->select_end = sel_start + inserted;
+    state->has_preferred_x = 0;
+}
+
 } // namespace ImStb
 
 // We added an extra indirection where 'Stb' is heap-allocated, in order facilitate the work of bindings generators.
@@ -4429,6 +4449,109 @@ void ImGuiInputTextState::SelectAll()                       { Stb->select_start 
 void ImGuiInputTextState::ReloadUserBufAndSelectAll()       { WantReloadUserBuf = true; ReloadSelectionStart = 0; ReloadSelectionEnd = INT_MAX; }
 void ImGuiInputTextState::ReloadUserBufAndKeepSelection()   { WantReloadUserBuf = true; ReloadSelectionStart = Stb->select_start; ReloadSelectionEnd = Stb->select_end; }
 void ImGuiInputTextState::ReloadUserBufAndMoveToEnd()       { WantReloadUserBuf = true; ReloadSelectionStart = ReloadSelectionEnd = INT_MAX; }
+
+// [SECTION] IME (Input Method Editor) composition
+// While a composition is active the marked text lives in ImeComposition and is only rendered; the
+// application-owned TextA buffer is left untouched until the input method commits the result.
+void ImGuiInputTextState::ImeClearComposition()
+{
+    ImeComposition.clear();
+    ImeCursorStart = ImeCursorLength = 0;
+    ImeActive = false;
+}
+
+void ImGuiInputTextState::ImeBeginComposition(const char* text_utf8, int cursor_start, int cursor_length)
+{
+    // Capture the editing position so a cancel can restore it exactly.
+    ImeStartCursor = Stb->cursor;
+    ImeStartSelectStart = Stb->select_start;
+    ImeStartSelectEnd = Stb->select_end;
+    ImeActive = true;
+    ImeUpdateComposition(text_utf8, cursor_start, cursor_length);
+    CursorAnimReset();
+}
+
+void ImGuiInputTextState::ImeUpdateComposition(const char* text_utf8, int cursor_start, int cursor_length)
+{
+    IM_ASSERT(ImeActive);
+    const int text_len = (int)ImStrlen(text_utf8);
+    IM_ASSERT(cursor_start >= 0 && cursor_start <= text_len);
+    IM_ASSERT(cursor_length >= 0 && cursor_start + cursor_length <= text_len);
+    ImeComposition.resize(text_len + 1);
+    memcpy(ImeComposition.Data, text_utf8, (size_t)text_len + 1);
+    ImeCursorStart = cursor_start;
+    ImeCursorLength = cursor_length;
+    CursorFollow = true; // Keep the marked text (and the OS candidate window) in view.
+    CursorAnimReset();
+}
+
+void ImGuiInputTextState::ImeCommitComposition(const char* text_utf8)
+{
+    if (!ImeActive)
+        return; // Defensive: a commit without a composition behaves as a regular insertion.
+    ImGuiContext* ctx = Ctx;
+    ImeClearComposition();
+
+    // Restore the selection captured when the composition started: the commit replaces that range.
+    Stb->cursor = ImeStartCursor;
+    Stb->select_start = ImeStartSelectStart;
+    Stb->select_end = ImeStartSelectEnd;
+
+    // Filter through the same path as regular input so CharFilter flags/callbacks are honored.
+    // (Same filtering semantics as clipboard paste, see the paste handling in InputTextEx().)
+    const int text_len = (int)ImStrlen(text_utf8);
+    if (text_len > 0)
+    {
+        ImVector<char> filtered;
+        filtered.reserve(text_len + 1);
+        const char* s = text_utf8;
+        const char* s_end = text_utf8 + text_len;
+        while (s < s_end)
+        {
+            unsigned int c = 0;
+            const int in_len = ImTextCharFromUtf8(&c, s, s_end);
+            s += in_len;
+            if (!InputTextFilterCharacter(ctx, this, &c, NULL, NULL, true))
+                continue;
+            char c_utf8[5];
+            ImTextCharToUtf8(c_utf8, c);
+            const int out_len = (int)ImStrlen(c_utf8);
+            filtered.resize(filtered.Size + out_len);
+            memcpy(filtered.Data + filtered.Size - out_len, c_utf8, (size_t)out_len);
+        }
+        if (filtered.Size > 0)
+        {
+            filtered.push_back(0);
+            ImStb::stb_textedit_ime_commit(this, Stb, filtered.Data, filtered.Size - 1);
+        }
+        else
+        {
+            // Everything filtered out: still collapse the selection the composition was anchored on.
+            ClearSelection();
+        }
+    }
+    else
+    {
+        // Empty commit: collapse the anchor selection without modifying the text.
+        ClearSelection();
+    }
+    EditedBefore = EditedThisFrame = true;
+    CursorFollow = true;
+    CursorAnimReset();
+}
+
+void ImGuiInputTextState::ImeCancelComposition()
+{
+    if (!ImeActive)
+        return;
+    ImeClearComposition();
+    // Restore the exact editing position from before the composition started; TextA was never modified.
+    Stb->cursor = ImeStartCursor;
+    Stb->select_start = ImeStartSelectStart;
+    Stb->select_end = ImeStartSelectEnd;
+    CursorFollow = true;
+    CursorAnimReset();
+}
 
 ImGuiInputTextCallbackData::ImGuiInputTextCallbackData()
 {
@@ -4678,6 +4801,9 @@ void ImGui::InputTextDeactivateHook(ImGuiID id)
     ImGuiInputTextState* state = &g.InputTextState;
     if (id == 0 || state->ID != id || g.ActiveId != id)
         return;
+    // A composition interrupted by focus loss is discarded: the buffer never received the marked text,
+    // so just drop it and restore the position captured when the composition started.
+    state->ImeCancelComposition();
     if (!state->EditedBefore)
         return;
     //IMGUI_DEBUG_LOG_ACTIVEID("InputTextDeactivateHook() id = 0x%08X\n", id);
@@ -4929,6 +5055,9 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     const bool init_make_active = (input_requested_by_user || input_requested_by_nav || input_requested_by_reactivate || user_scroll_finish);
     if (init_reload_from_user_buf)
     {
+        // An external buffer reload while an IME composition is active invalidates the marked text:
+        // discard it so the new content is rendered without a stale composition.
+        state->ImeCancelComposition();
         int new_len = (int)ImStrlen(buf);
         IM_ASSERT(new_len + 1 <= buf_size && "Is your input buffer properly zero-terminated?");
         state->WantReloadUserBuf = false;
@@ -5101,7 +5230,14 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
         const float mouse_x = (io.MousePos.x - frame_bb.Min.x - style.FramePadding.x) + state->Scroll.x;
         const float mouse_y = (is_multiline ? (io.MousePos.y - draw_window->DC.CursorPos.y) : (g.FontSize * 0.5f));
 
-        if (select_all)
+        if (state->ImeActive)
+        {
+            // During an IME composition the input method owns the caret/selection: ignore mouse
+            // clicks and drags so the commit anchor captured on begin is not moved underneath us.
+            if (state->SelectedAllMouseLock && !io.MouseDown[0])
+                state->SelectedAllMouseLock = false;
+        }
+        else if (select_all)
         {
             state->SelectAll();
             state->SelectedAllMouseLock = true;
@@ -5181,6 +5317,36 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             */
         }
 
+        // Process IME (Input Method Editor) composition events before regular character input.
+        // Marked/preedit text is only rendered until the input method commits or cancels it.
+        if (!is_readonly && g.ImeEventsQueue.Size > 0)
+        {
+            for (int n = 0; n < g.ImeEventsQueue.Size; n++)
+            {
+                const ImGuiContext::ImeEvent& ime_evt = g.ImeEventsQueue[n];
+                const char* ime_text = ime_evt.TextOffset >= 0 ? (g.ImeEventTextStorage.Data + ime_evt.TextOffset) : "";
+                switch (ime_evt.Type)
+                {
+                case ImGuiInputEventImeType_Composition:
+                    if (!state->ImeActive)
+                        state->ImeBeginComposition(ime_text, ime_evt.CursorStart, ime_evt.CursorLength);
+                    else
+                        state->ImeUpdateComposition(ime_text, ime_evt.CursorStart, ime_evt.CursorLength);
+                    break;
+                case ImGuiInputEventImeType_Commit:
+                    state->ImeCommitComposition(ime_text);
+                    break;
+                case ImGuiInputEventImeType_Cancel:
+                    state->ImeCancelComposition();
+                    break;
+                default:
+                    break;
+                }
+            }
+            g.ImeEventsQueue.clear();
+            g.ImeEventTextStorage.clear();
+        }
+
         // Process regular text input (before we check for Return because using some IME will effectively send a Return?)
         // We ignore Ctrl inputs, but need to allow Alt+Ctrl as some keyboards (e.g. German) use AltGR (which _is_ Alt+Ctrl) to input certain characters.
         const bool ignore_char_inputs = (io.KeyCtrl && !io.KeyAlt) || (is_osx && io.KeyCtrl);
@@ -5192,6 +5358,10 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                     // Insert character if they pass filtering
                     unsigned int c = (unsigned int)io.InputQueueCharacters[n];
                     if (c == '\t') // Skip Tab, see above.
+                        continue;
+                    // A direct character input while an IME composition is active would corrupt the marked
+                    // text: backends are expected to route marked text through IME events, so discard stray chars.
+                    if (state->ImeActive)
                         continue;
                     if (InputTextFilterCharacter(&g, state, &c, callback, callback_user_data))
                         state->OnCharPressed(c);
@@ -5235,6 +5405,29 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
 
         // FIXME: Should use more Shortcut() and reduce IsKeyPressed()+SetKeyOwner(), but requires modifiers combination to be taken account of.
         // FIXME-OSX: Missing support for Alt(option)+Right/Left = go to end of line, or next line if already in end of line.
+        // While an IME composition is active the input method owns text-editing keys (arrows, backspace,
+        // etc.): let it consume them instead of mutating the underlying buffer behind the marked text.
+        const bool ime_composition_active = state->ImeActive;
+        if (ime_composition_active && is_cancel)
+        {
+            // Escape while composing: ask the input method (and our state) to discard the marked text.
+            state->ImeCancelComposition();
+        }
+        else if (ime_composition_active && is_copy)
+        {
+            // Copy of the committed text remains allowed; cut/paste/undo and editing keys are deferred.
+            if (g.PlatformIO.Platform_SetClipboardTextFn != NULL)
+            {
+                const int ib = state->HasSelection() ? ImMin(state->Stb->select_start, state->Stb->select_end) : 0;
+                const int ie = state->HasSelection() ? ImMax(state->Stb->select_start, state->Stb->select_end) : state->TextLen;
+                g.TempBuffer.reserve(ie - ib + 1);
+                memcpy(g.TempBuffer.Data, state->TextSrc + ib, ie - ib);
+                g.TempBuffer.Data[ie - ib] = 0;
+                SetClipboardText(g.TempBuffer.Data);
+            }
+        }
+        else if (!ime_composition_active)
+        {
         if (IsKeyPressed(ImGuiKey_LeftArrow))                        { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINESTART : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDLEFT : STB_TEXTEDIT_K_LEFT) | k_mask); }
         else if (IsKeyPressed(ImGuiKey_RightArrow))                  { state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_LINEEND : is_wordmove_key_down ? STB_TEXTEDIT_K_WORDRIGHT : STB_TEXTEDIT_K_RIGHT) | k_mask); }
         else if (IsKeyPressed(ImGuiKey_UpArrow) && is_multiline)     { if (io.KeyCtrl) SetScrollY(draw_window, ImMax(draw_window->Scroll.y - g.FontSize, 0.0f)); else state->OnKeyPressed((is_startend_key_down ? STB_TEXTEDIT_K_TEXTSTART : STB_TEXTEDIT_K_UP) | k_mask); }
@@ -5368,6 +5561,7 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                 }
             }
         }
+        } // end !ime_composition_active
 
         // Update render selection flag after events have been handled, so selection highlight can be displayed during the same frame.
         render_selection |= state->HasSelection() && (RENDER_SELECTION_WHEN_INACTIVE || render_cursor);
@@ -5618,6 +5812,33 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             buf_display_end = buf_display + ImStrlen(buf_display);
     }
 
+    // IME composition: build a virtual display buffer with the marked text inserted at the current
+    // editing position. The application-owned text (TextA) is untouched until commit, but the marked
+    // string and its selection are rendered inline as if it had been typed.
+    const bool ime_active = (state != NULL && state->ID == id && state->ImeActive);
+    int ime_insert_pos = 0;      // UTF-8 offset where the marked text starts in the virtual buffer.
+    int ime_mark_sel_start = 0;  // Virtual-buffer offsets of the marked-text selection.
+    int ime_mark_sel_end = 0;
+    int ime_caret_pos = 0;       // Virtual-buffer offset of the composition caret (end of marked selection).
+    if (ime_active)
+    {
+        ime_insert_pos = state->Stb->cursor;
+        const int base_len = (int)(buf_display_end - buf_display);
+        const int comp_len = (int)ImStrlen(state->ImeComposition.Data);
+        g.TempBuffer.reserve(base_len + comp_len + 1);
+        g.TempBuffer.resize(base_len + comp_len + 1);
+        char* virtual_buf = g.TempBuffer.Data;
+        memcpy(virtual_buf, buf_display, (size_t)ime_insert_pos);
+        memcpy(virtual_buf + ime_insert_pos, state->ImeComposition.Data, (size_t)comp_len);
+        memcpy(virtual_buf + ime_insert_pos + comp_len, buf_display + ime_insert_pos, (size_t)(base_len - ime_insert_pos));
+        virtual_buf[base_len + comp_len] = 0;
+        ime_mark_sel_start = ime_insert_pos + state->ImeCursorStart;
+        ime_mark_sel_end = ime_mark_sel_start + state->ImeCursorLength;
+        ime_caret_pos = ime_mark_sel_end; // Caret follows the marked selection.
+        buf_display = virtual_buf;
+        buf_display_end = virtual_buf + base_len + comp_len;
+    }
+
     // Calculate visibility
     int line_visible_n0 = 0, line_visible_n1 = 1;
     if (is_multiline)
@@ -5642,7 +5863,10 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     //GetForegroundDrawList()->AddRect(draw_pos + ImVec2(0, line_visible_n0 * g.FontSize), draw_pos + ImVec2(frame_size.x, line_visible_n1 * g.FontSize), IM_COL32(255, 0, 0, 255));
 
     // Calculate blinking cursor position
-    const ImVec2 cursor_offset = render_cursor && state ? InputTextLineIndexGetPosOffset(g, state, line_index, buf_display, buf_display_end, state->Stb->cursor) : ImVec2(0.0f, 0.0f);
+    // During an IME composition the caret marks the insertion point of the marked text (end of its
+    // marked selection) rather than the stb cursor, which stays parked at the composition anchor.
+    const int cursor_pos_n = ime_active ? ime_caret_pos : (state ? state->Stb->cursor : 0);
+    const ImVec2 cursor_offset = render_cursor && state ? InputTextLineIndexGetPosOffset(g, state, line_index, buf_display, buf_display_end, cursor_pos_n) : ImVec2(0.0f, 0.0f);
     ImVec2 draw_scroll;
 
     // Render text. We currently only render selection when the widget is active or while scrolling.
@@ -5715,8 +5939,18 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
             const float bg_offy_dn = is_multiline ? 0.0f : 2.0f;
             const float bg_eol_width = IM_TRUNC(g.FontBaked->GetCharAdvance((ImWchar)' ') * 0.50f); // So we can see selected empty lines
 
-            const char* text_selected_begin = buf_display + ImMin(state->Stb->select_start, state->Stb->select_end);
-            const char* text_selected_end = buf_display + ImMax(state->Stb->select_start, state->Stb->select_end);
+            // stb selection offsets index the real buffer; shift them past the inserted marked text
+            // when rendering against the virtual IME display buffer.
+            const int comp_len = ime_active ? (int)ImStrlen(state->ImeComposition.Data) : 0;
+            int stb_sel_min = ImMin(state->Stb->select_start, state->Stb->select_end);
+            int stb_sel_max = ImMax(state->Stb->select_start, state->Stb->select_end);
+            if (ime_active)
+            {
+                stb_sel_min += (stb_sel_min >= ime_insert_pos) ? comp_len : 0;
+                stb_sel_max += (stb_sel_max >= ime_insert_pos) ? comp_len : 0;
+            }
+            const char* text_selected_begin = buf_display + stb_sel_min;
+            const char* text_selected_end = buf_display + stb_sel_max;
             for (int line_n = line_visible_n0; line_n < line_visible_n1; line_n++)
             {
                 const char* p = line_index->get_line_begin(buf_display, line_n);
@@ -5743,6 +5977,36 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
                 rect.Min.y += bg_offy_up;
                 rect.ClipWith(clip_rect);
                 draw_window->DrawList->AddRectFilled(rect.Min, rect.Max, bg_color);
+            }
+        }
+
+        // Draw the IME marked-text selection (the highlighted portion of the preedit string).
+        // This is the range the input method reports as selected inside its composition.
+        if (ime_active && ime_mark_sel_end > ime_mark_sel_start)
+        {
+            const ImU32 mark_color = GetColorU32(ImGuiCol_TextSelectedBg, 1.0f);
+            const float bg_offy_up = is_multiline ? 0.0f : -1.0f;
+            const float bg_offy_dn = is_multiline ? 0.0f : 2.0f;
+            const char* mark_begin = buf_display + ime_mark_sel_start;
+            const char* mark_end = buf_display + ime_mark_sel_end;
+            for (int line_n = line_visible_n0; line_n < line_visible_n1; line_n++)
+            {
+                const char* p = line_index->get_line_begin(buf_display, line_n);
+                const char* p_eol = line_index->get_line_end(buf_display, line_n);
+                const bool p_eol_is_wrap = (p_eol < buf_display_end && *p_eol != '\n');
+                if (p_eol_is_wrap)
+                    p_eol++;
+                const char* line_mark_begin = (mark_begin > p) ? mark_begin : p;
+                const char* line_mark_end = (mark_end < p_eol) ? mark_end : p_eol;
+                if (line_mark_begin >= line_mark_end)
+                    continue;
+                ImRect rect;
+                rect.Min.x = draw_pos.x - draw_scroll.x + CalcTextSize(p, line_mark_begin).x;
+                rect.Min.y = draw_pos.y - draw_scroll.y + line_n * g.FontSize + bg_offy_up;
+                rect.Max.x = rect.Min.x + CalcTextSize(line_mark_begin, line_mark_end).x;
+                rect.Max.y = rect.Min.y + bg_offy_dn + g.FontSize;
+                rect.ClipWith(clip_rect);
+                draw_window->DrawList->AddRectFilled(rect.Min, rect.Max, mark_color);
             }
         }
     }

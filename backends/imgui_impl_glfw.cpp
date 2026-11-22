@@ -179,6 +179,13 @@
 #define GLFW_HAS_GETKEYNAME             (GLFW_VERSION_COMBINED >= 3200) // 3.2+ glfwGetKeyName()
 #define GLFW_HAS_GETERROR               (GLFW_VERSION_COMBINED >= 3300) // 3.3+ glfwGetError()
 #define GLFW_HAS_GETPLATFORM            (GLFW_VERSION_COMBINED >= 3400) // 3.4+ glfwGetPlatform()
+// 3.6+ glfwSetPreeditCallback(): marked/preedit text with UTF-8 selection offsets (IME support).
+// Detect via the cursor-position enum introduced together with the callback rather than version alone.
+#ifdef GLFW_PREEDIT_CURSOR_AFTER_PREVIOUS
+#define GLFW_HAS_PREEDIT_CALLBACK       (1)
+#else
+#define GLFW_HAS_PREEDIT_CALLBACK       (0)
+#endif
 
 // Map GLFWWindow* to ImGuiContext*.
 // - Would be simpler if we could use glfwSetWindowUserPointer()/glfwGetWindowUserPointer(), but this is a single and shared resource.
@@ -227,6 +234,9 @@ struct ImGui_ImplGlfw_Data
     GLFWkeyfun              PrevUserCallbackKey;
     GLFWcharfun             PrevUserCallbackChar;
     GLFWmonitorfun          PrevUserCallbackMonitor;
+#if GLFW_HAS_PREEDIT_CALLBACK
+    GLFWpreeditfun          PrevUserCallbackPreedit;
+#endif
 #ifdef _WIN32
     WNDPROC                 PrevWndProc;
 #endif
@@ -551,6 +561,38 @@ void ImGui_ImplGlfw_CharCallback(GLFWwindow* window, unsigned int c)
     io.AddInputCharacter(c);
 }
 
+#if GLFW_HAS_PREEDIT_CALLBACK
+// GLFW 3.6+ IME preedit callback: 'text' is the marked/preedit UTF-8 string, with the marked
+// block given as UTF-8 byte offsets and the caret as either an offset or a GLFW_PREEDIT_CURSOR_* value.
+// An empty text signals a canceled composition.
+void ImGui_ImplGlfw_PreeditCallback(GLFWwindow* window, const char* text, int block_start, int block_length, int caret_pos, int caret_anchor)
+{
+    ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData(window);
+    if (bd->PrevUserCallbackPreedit != nullptr && ImGui_ImplGlfw_ShouldChainCallback(bd, window))
+        bd->PrevUserCallbackPreedit(window, text, block_start, block_length, caret_pos, caret_anchor);
+
+    ImGuiIO& io = ImGui::GetIO(bd->Context);
+    if (text != nullptr && text[0] != 0)
+    {
+        const int text_len = (int)strlen(text);
+        int sel_start = block_start;
+        int sel_length = block_length;
+        if (sel_start < 0 || sel_start > text_len) // Platform reports no marked block, only a caret.
+        {
+            sel_start = (caret_pos >= 0 && caret_pos <= text_len) ? caret_pos : text_len;
+            sel_length = 0;
+        }
+        sel_start = ImClamp(sel_start, 0, text_len);
+        sel_length = ImClamp(sel_length, 0, text_len - sel_start);
+        io.AddImeCompositionEvent(text, sel_start, sel_length);
+    }
+    else
+    {
+        io.AddImeCancelEvent();
+    }
+}
+#endif // GLFW_HAS_PREEDIT_CALLBACK
+
 void ImGui_ImplGlfw_MonitorCallback(GLFWmonitor*, int)
 {
     // Unused in 'master' branch but 'docking' branch will use this, so we declare it ahead of it so if you have to install callbacks you can install this one too.
@@ -621,6 +663,9 @@ void ImGui_ImplGlfw_InstallCallbacks(GLFWwindow* window)
     bd->PrevUserCallbackKey = glfwSetKeyCallback(window, ImGui_ImplGlfw_KeyCallback);
     bd->PrevUserCallbackChar = glfwSetCharCallback(window, ImGui_ImplGlfw_CharCallback);
     bd->PrevUserCallbackMonitor = glfwSetMonitorCallback(ImGui_ImplGlfw_MonitorCallback);
+#if GLFW_HAS_PREEDIT_CALLBACK
+    bd->PrevUserCallbackPreedit = glfwSetPreeditCallback(window, ImGui_ImplGlfw_PreeditCallback);
+#endif
     bd->InstalledCallbacks = true;
 }
 
@@ -638,6 +683,9 @@ void ImGui_ImplGlfw_RestoreCallbacks(GLFWwindow* window)
     glfwSetKeyCallback(window, bd->PrevUserCallbackKey);
     glfwSetCharCallback(window, bd->PrevUserCallbackChar);
     glfwSetMonitorCallback(bd->PrevUserCallbackMonitor);
+#if GLFW_HAS_PREEDIT_CALLBACK
+    glfwSetPreeditCallback(window, bd->PrevUserCallbackPreedit);
+#endif
     bd->InstalledCallbacks = false;
     bd->PrevUserCallbackWindowFocus = nullptr;
     bd->PrevUserCallbackCursorEnter = nullptr;
@@ -647,6 +695,9 @@ void ImGui_ImplGlfw_RestoreCallbacks(GLFWwindow* window)
     bd->PrevUserCallbackKey = nullptr;
     bd->PrevUserCallbackChar = nullptr;
     bd->PrevUserCallbackMonitor = nullptr;
+#if GLFW_HAS_PREEDIT_CALLBACK
+    bd->PrevUserCallbackPreedit = nullptr;
+#endif
 }
 
 // Set to 'true' to enable chaining installed callbacks for all windows (including secondary viewports created by backends or by user).

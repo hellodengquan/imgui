@@ -29,6 +29,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2026-11-23: Inputs: implemented NSTextInputClient marked-text (IME composition) support, feeding marked/preedit text and its selection through io.AddImeCompositionEvent()/AddImeCommitEvent()/AddImeCancelEvent().
 //  2025-09-18: Call platform_io.ClearPlatformHandlers() on shutdown.
 //  2025-06-27: Added ImGuiMouseCursor_Wait and ImGuiMouseCursor_Progress mouse cursor support.
 //  2025-06-12: ImGui_ImplOSX_HandleEvent() only process event for window containing our view. (#8644)
@@ -133,6 +134,9 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view);
     float _posX;
     float _posY;
     NSRect _imeRect;
+    NSString* _markedText;      // Current IME marked/preedit text (UTF-16 as stored by NSString).
+    NSRange _markedRange;       // Range of the marked text within our virtual document.
+    NSRange _markedSelection;   // Selection inside the marked text, as reported by setMarkedText:.
 }
 
 #pragma mark - Public
@@ -152,6 +156,17 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view);
         NSRect contentRect = [window contentRectForFrameRect:window.frame];
         NSRect rect = NSMakeRect(_posX, contentRect.size.height - _posY, 0, 0);
         _imeRect = [window convertRectToScreen:rect];
+    }
+}
+
+// Called when the input context is deactivated while marked text exists: forward an explicit
+// cancellation so the core restores the editing position captured before the composition.
+- (void)discardMarkedComposition
+{
+    if (_markedText != nil)
+    {
+        ImGui::GetIO().AddImeCancelEvent();
+        [self unmarkText];
     }
 }
 
@@ -186,7 +201,12 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view);
     else
         characters = (NSString*)aString;
 
-    io.AddInputCharactersUTF8(characters.UTF8String);
+    // AppKit calls unmarkText internally when a marked composition ends in a commit, so the marked
+    // state is already cleared here; simply submit the final text as a single IME commit.
+    if (characters.length > 0)
+        io.AddImeCommitEvent(characters.UTF8String);
+    else
+        io.AddImeCancelEvent();
 }
 
 - (BOOL)acceptsFirstResponder
@@ -215,25 +235,69 @@ static bool ImGui_ImplOSX_HandleEvent(NSEvent* event, NSView* view);
 
 - (BOOL)hasMarkedText
 {
-    return NO;
+    return _markedText != nil;
 }
 
 - (NSRange)markedRange
 {
-    return NSMakeRange(NSNotFound, 0);
+    return _markedText != nil ? _markedRange : NSMakeRange(NSNotFound, 0);
 }
 
 - (NSRange)selectedRange
 {
+    // Report the selection inside the marked text while composing; otherwise the input system
+    // treats us as having no selection (NSNotFound), matching the previous behavior.
+    if (_markedText != nil)
+        return NSMakeRange(_markedRange.location + _markedSelection.location, _markedSelection.length);
     return NSMakeRange(NSNotFound, 0);
 }
 
 - (void)setMarkedText:(nonnull id)string selectedRange:(NSRange)selectedRange replacementRange:(NSRange)replacementRange
 {
+    ImGuiIO& io = ImGui::GetIO();
+
+    NSString* marked;
+    if ([string isKindOfClass:[NSAttributedString class]])
+        marked = [string string];
+    else
+        marked = (NSString*)string;
+
+    // An empty marked string ends the composition without inserting anything.
+    if (marked.length == 0)
+    {
+        [self unmarkText];
+        io.AddImeCancelEvent();
+        return;
+    }
+
+    // First marked text of a composition begins at a stable virtual document location.
+    if (_markedText == nil)
+        _markedRange = NSMakeRange(0, 0);
+    _markedText = [marked copy];
+    _markedRange.length = marked.length;
+    // selectedRange is expressed relative to the marked text; clamp it defensively.
+    const NSUInteger sel_loc = MIN(selectedRange.location, marked.length);
+    const NSUInteger sel_len = MIN(selectedRange.length, marked.length - sel_loc);
+    _markedSelection = NSMakeRange(sel_loc, sel_len);
+
+    // Dear ImGui indexes text with UTF-8 byte offsets; convert the marked selection by
+    // re-encoding the UTF-16 prefix/selection ranges as UTF-8.
+    const char* utf8 = marked.UTF8String;
+    const int cursor_start = (int)strlen([[marked substringToIndex:sel_loc] UTF8String]);
+    const int cursor_length = (int)strlen([[marked substringWithRange:NSMakeRange(sel_loc, sel_len)] UTF8String]);
+    io.AddImeCompositionEvent(utf8 != NULL ? utf8 : "", cursor_start, cursor_length);
 }
 
 - (void)unmarkText
 {
+    // Clears our local marked-text state only. AppKit calls this both on commit (in which case
+    // insertText: follows with the final text) and when discarding a composition, so no IME event
+    // is emitted here: the core keeps its own state until a commit/cancel event arrives.
+    if (_markedText == nil)
+        return;
+    _markedText = nil;
+    _markedRange = NSMakeRange(NSNotFound, 0);
+    _markedSelection = NSMakeRange(NSNotFound, 0);
 }
 
 - (nonnull NSArray<NSAttributedStringKey>*)validAttributesForMarkedText
@@ -491,6 +555,7 @@ bool ImGui_ImplOSX_Init(NSView* view)
         }
         else
         {
+            [bd->KeyEventResponder discardMarkedComposition];
             [bd->InputContext discardMarkedText];
             [bd->InputContext invalidateCharacterCoordinates];
             [bd->InputContext deactivate];

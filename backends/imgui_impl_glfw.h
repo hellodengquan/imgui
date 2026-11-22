@@ -62,6 +62,12 @@ IMGUI_IMPL_API void     ImGui_ImplGlfw_KeyCallback(GLFWwindow* window, int key, 
 IMGUI_IMPL_API void     ImGui_ImplGlfw_CharCallback(GLFWwindow* window, unsigned int c);
 IMGUI_IMPL_API void     ImGui_ImplGlfw_MonitorCallback(GLFWmonitor* monitor, int event);
 
+// GLFW 3.6+ IME preedit callback (individual callback to call yourself if you didn't install callbacks).
+// Marked/preedit text is UTF-8 with the marked selection given as UTF-8 byte offsets.
+#ifdef GLFW_PREEDIT_CURSOR_AFTER_PREVIOUS
+IMGUI_IMPL_API void     ImGui_ImplGlfw_PreeditCallback(GLFWwindow* window, const char* text, int block_start, int block_length, int caret_pos, int caret_anchor);
+#endif
+
 // GLFW helpers
 IMGUI_IMPL_API void     ImGui_ImplGlfw_Sleep(int milliseconds);
 IMGUI_IMPL_API float    ImGui_ImplGlfw_GetContentScaleForWindow(GLFWwindow* window);

@@ -1353,10 +1353,22 @@ struct IMGUI_API ImGuiInputTextState
     int                     ReloadSelectionStart;
     int                     ReloadSelectionEnd;
 
+    // IME (Input Method Editor) composition state.
+    // While a composition is active, ImeComposition holds the marked/preedit text (UTF-8) which is rendered
+    // in-place at the editing position but NOT committed to TextA until the input method confirms it.
+    // ImeCursorStart/ImeCursorLength describe the selection inside the marked text, also in UTF-8 bytes.
+    ImVector<char>          ImeComposition;         // Current marked/preedit UTF-8 string (always zero terminated). Empty when no composition is active.
+    int                     ImeCursorStart;         // Start of selection within ImeComposition (UTF-8 byte offset).
+    int                     ImeCursorLength;        // Length of selection within ImeComposition (UTF-8 bytes).
+    int                     ImeStartCursor;         // Value of Stb->cursor saved when the composition started.
+    int                     ImeStartSelectStart;    // Value of Stb->select_start saved when the composition started.
+    int                     ImeStartSelectEnd;      // Value of Stb->select_end saved when the composition started.
+    bool                    ImeActive;              // True between the first composition event and its commit/cancel.
+
     ImGuiInputTextState();
     ~ImGuiInputTextState();
     void        ClearText()                 { TextLen = 0; TextA[0] = 0; CursorClamp(); }
-    void        ClearFreeMemory()           { TextA.clear(); TextToRevertTo.clear(); }
+    void        ClearFreeMemory()           { TextA.clear(); TextToRevertTo.clear(); ImeComposition.clear(); }
     void        OnKeyPressed(int key);      // Cannot be inline because we call in code in stb_textedit.h implementation
     void        OnCharPressed(unsigned int c);
     float       GetPreferredOffsetX() const;
@@ -1372,6 +1384,13 @@ struct IMGUI_API ImGuiInputTextState
     int         GetSelectionEnd() const;
     void        SetSelection(int start, int end);
     void        SelectAll();
+
+    // IME composition
+    void        ImeBeginComposition(const char* text_utf8, int cursor_start, int cursor_length);
+    void        ImeUpdateComposition(const char* text_utf8, int cursor_start, int cursor_length);
+    void        ImeCommitComposition(const char* text_utf8);   // Empty text cancels the composition.
+    void        ImeCancelComposition();
+    void        ImeClearComposition();
 
     // Reload user buf (WIP #2890)
     // If you modify underlying user-passed const char* while active you need to call this (InputText V2 may lift this)
@@ -1646,6 +1665,20 @@ struct ImGuiInputEventMouseButton   { int Button; bool Down; ImGuiMouseSource Mo
 struct ImGuiInputEventKey           { ImGuiKey Key; bool Down; float AnalogValue; };
 struct ImGuiInputEventText          { unsigned int Char; };
 struct ImGuiInputEventAppFocused    { bool Focused; };
+
+// IME (Input Method Editor) composition event kinds, queued by backends from their platform
+// text-input callbacks (e.g. macOS NSTextInputClient, SDL SDL_EVENT_TEXT_EDITING, GLFW preedit).
+// - Composition: a new marked/preedit string is being edited by the input method.
+// - Commit:      the input method finished editing, the text must replace the active selection
+//                as a single undo-able operation. An empty text cancels the composition.
+// - Cancel:      the input method discarded the marked text; editing position must be restored.
+enum ImGuiInputEventImeType
+{
+    ImGuiInputEventImeType_None = 0,
+    ImGuiInputEventImeType_Composition,
+    ImGuiInputEventImeType_Commit,
+    ImGuiInputEventImeType_Cancel
+};
 
 struct ImGuiInputEvent
 {
@@ -2351,6 +2384,19 @@ struct ImGuiContext
     ImVector<ImGuiInputEvent> InputEventsTrail;                 // Past input events processed in NewFrame(). This is to allow domain-specific application to access e.g mouse/pen trail.
     ImGuiMouseSource        InputEventsNextMouseSource;
     ImU32                   InputEventsNextEventId;
+
+    // IME (Input Method Editor) events queued by backends (see ImGuiInputEventIme*). Consumed by the active InputText() during the frame, cleared at end of frame.
+    // Each event owns a copy of its text so backend callbacks can return/reuse their buffers immediately.
+    ImVector<char>          ImeEventTextStorage;                 // Backing storage for the UTF-8 strings referenced by ImeEventsQueue.
+    struct ImeEvent
+    {
+        ImGuiInputEventImeType Type;
+        int                     TextOffset;                     // Offset in ImeEventTextStorage (-1 if no text).
+        int                     TextLength;                     // Length in bytes (not including zero terminator).
+        int                     CursorStart;                    // Composition only: UTF-8 start of the marked selection.
+        int                     CursorLength;                   // Composition only: UTF-8 length of the marked selection.
+    };
+    ImVector<ImeEvent>      ImeEventsQueue;
 
     // Windows state
     ImVector<ImGuiWindow*>  Windows;                            // Windows, sorted in display order, back to front

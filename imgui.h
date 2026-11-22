@@ -2600,6 +2600,18 @@ struct ImGuiIO
     IMGUI_API void  AddInputCharacterUTF16(ImWchar16 c);                    // Queue a new character input from a UTF-16 character, it can be a surrogate
     IMGUI_API void  AddInputCharactersUTF8(const char* str);                // Queue a new characters input from a UTF-8 string
 
+    // IME (Input Method Editor) composition functions.
+    // Backends supporting marked/preedit text call these from their platform text-input callbacks:
+    // - AddImeCompositionEvent(): update the marked text currently edited by the input method, with the
+    //   selection inside the marked text given as UTF-8 byte offsets (cursor_start, cursor_length).
+    // - AddImeCommitEvent(): submit the final text. The active text field applies it as a single undo-able
+    //   selection replacement. Passing an empty string is equivalent to AddImeCancelEvent().
+    // - AddImeCancelEvent(): discard the marked text and restore the editing position captured when the
+    //   composition started, leaving the field contents untouched.
+    IMGUI_API void  AddImeCompositionEvent(const char* text_utf8, int cursor_start, int cursor_length);
+    IMGUI_API void  AddImeCommitEvent(const char* text_utf8);
+    IMGUI_API void  AddImeCancelEvent();
+
     IMGUI_API void  SetKeyEventNativeData(ImGuiKey key, int native_keycode, int native_scancode, int native_legacy_index = -1); // [Optional] Specify index for legacy <1.87 IsKeyXXX() functions with native indices + specify native keycode, scancode.
     IMGUI_API void  SetAppAcceptingEvents(bool accepting_events);           // Set master flag for accepting key/mouse/text events (default to true). Useful if you have native dialog boxes that are interrupting your application loop/refresh, and you want to disable events being queued while your app is frozen.
     IMGUI_API void  ClearEventsQueue();                                     // Clear all incoming events.

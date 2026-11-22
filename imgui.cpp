@@ -1876,12 +1876,61 @@ void ImGuiIO::AddInputCharactersUTF8(const char* str)
     }
 }
 
+// Queue an IME composition (marked/preedit text) event. The string is copied so the caller
+// can free/reuse its buffer immediately. Cursor offsets are UTF-8 byte offsets into the string.
+void ImGuiIO::AddImeCompositionEvent(const char* text_utf8, int cursor_start, int cursor_length)
+{
+    IM_ASSERT(Ctx != NULL);
+    ImGuiContext& g = *Ctx;
+    if (!AppAcceptingEvents || text_utf8 == NULL)
+        return;
+    const int text_len = (int)strlen(text_utf8);
+    cursor_start = ImClamp(cursor_start, 0, text_len);
+    cursor_length = ImClamp(cursor_length, 0, text_len - cursor_start);
+
+    const int text_offset = g.ImeEventTextStorage.Size;
+    g.ImeEventTextStorage.resize(text_offset + text_len + 1); // Include zero terminator.
+    memcpy(g.ImeEventTextStorage.Data + text_offset, text_utf8, (size_t)text_len + 1);
+    g.ImeEventsQueue.push_back(ImGuiContext::ImeEvent { ImGuiInputEventImeType_Composition, text_offset, text_len, cursor_start, cursor_length });
+}
+
+// Queue an IME commit event. An empty text cancels the composition without touching the buffer.
+void ImGuiIO::AddImeCommitEvent(const char* text_utf8)
+{
+    IM_ASSERT(Ctx != NULL);
+    ImGuiContext& g = *Ctx;
+    if (!AppAcceptingEvents || text_utf8 == NULL)
+        return;
+    const int text_len = (int)strlen(text_utf8);
+    if (text_len == 0)
+    {
+        g.ImeEventsQueue.push_back(ImGuiContext::ImeEvent { ImGuiInputEventImeType_Cancel, -1, 0, 0, 0 });
+        return;
+    }
+    const int text_offset = g.ImeEventTextStorage.Size;
+    g.ImeEventTextStorage.resize(text_offset + text_len + 1);
+    memcpy(g.ImeEventTextStorage.Data + text_offset, text_utf8, (size_t)text_len + 1);
+    g.ImeEventsQueue.push_back(ImGuiContext::ImeEvent { ImGuiInputEventImeType_Commit, text_offset, text_len, 0, 0 });
+}
+
+// Queue an IME cancel event: marked text is discarded and the pre-composition position is restored.
+void ImGuiIO::AddImeCancelEvent()
+{
+    IM_ASSERT(Ctx != NULL);
+    ImGuiContext& g = *Ctx;
+    if (!AppAcceptingEvents)
+        return;
+    g.ImeEventsQueue.push_back(ImGuiContext::ImeEvent { ImGuiInputEventImeType_Cancel, -1, 0, 0, 0 });
+}
+
 // Clear all incoming events.
 void ImGuiIO::ClearEventsQueue()
 {
     IM_ASSERT(Ctx != NULL);
     ImGuiContext& g = *Ctx;
     g.InputEventsQueue.clear();
+    g.ImeEventsQueue.clear();
+    g.ImeEventTextStorage.clear();
 }
 
 // Clear current keyboard/gamepad state + current frame text input buffer. Equivalent to releasing all keys/buttons.
@@ -6291,6 +6340,10 @@ void ImGui::EndFrame()
     g.IO.AppFocusLost = false;
     g.IO.MouseWheel = g.IO.MouseWheelH = 0.0f;
     g.IO.InputQueueCharacters.resize(0);
+
+    // IME events are consumed by the active InputText() during the frame; whatever remains is dropped.
+    g.ImeEventsQueue.clear();
+    g.ImeEventTextStorage.clear();
 
     CallContextHooks(&g, ImGuiContextHookType_EndFramePost);
 }
