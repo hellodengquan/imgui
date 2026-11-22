@@ -16,6 +16,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2026-11-23: Metal: Convert clip rectangles to scissor rects by flooring the min boundary and ceiling the max boundary (instead of truncating min and size separately), matching the OpenGL backends so adjacent clip regions have consistent pixel edge ownership at fractional FramebufferScale.
 //  2026-10-06: Added support for render passes with multiple color attachments: we render to the first one and leave the others untouched. (#9574)
 //  2026-09-07: Round framebuffer dimensions to the nearest integer instead of truncating them. (#9538, 9515, #8628)
 //  2026-04-28: Added support for standard draw callbacks (in platform_io): DrawCallback_SetSamplerLinear and DrawCallback_SetSamplerNearest. (#9378, #9381)
@@ -48,6 +49,7 @@
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_metal.h"
 #import <time.h>
+#import <math.h>      // floorf(), ceilf()
 #import <Metal/Metal.h>
 
 #pragma mark - Support classes
@@ -200,6 +202,32 @@ static void ImGui_ImplMetal_DrawCallback_ResetRenderState(const ImDrawList*, con
 static void ImGui_ImplMetal_DrawCallback_SetSamplerLinear(const ImDrawList*, const ImDrawCmd*)  { ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData(); [bd->RenderCommandEncoder setFragmentSamplerState:bd->SharedMetalContext.samplerStateLinear atIndex:0]; }
 static void ImGui_ImplMetal_DrawCallback_SetSamplerNearest(const ImDrawList*, const ImDrawCmd*) { ImGui_ImplMetal_Data* bd = ImGui_ImplMetal_GetBackendData(); [bd->RenderCommandEncoder setFragmentSamplerState:bd->SharedMetalContext.samplerStateNearest atIndex:0]; }
 
+// Convert a floating point clip rectangle (in framebuffer pixels) to a Metal scissor rectangle.
+// - The min boundary is floored and the max boundary ceiled so that every covered framebuffer
+//   pixel is included and two adjacent clip regions share the exact same edge pixel ownership
+//   (no gap, no double ownership). This matches the convention used by the OpenGL backends.
+// - The result is clamped to the framebuffer bounds as setScissorRect() rejects off-bounds rectangles.
+static MTLScissorRect ImGui_ImplMetal_GetScissorRect(const ImVec2& clip_min_f, const ImVec2& clip_max_f, int fb_width, int fb_height)
+{
+    int clip_min_x = (int)floorf(clip_min_f.x);
+    int clip_min_y = (int)floorf(clip_min_f.y);
+    int clip_max_x = (int)ceilf(clip_max_f.x);
+    int clip_max_y = (int)ceilf(clip_max_f.y);
+
+    // Clamp to viewport as setScissorRect() won't accept values that are off bounds.
+    if (clip_min_x < 0) { clip_min_x = 0; } if (clip_min_x > fb_width)  { clip_min_x = fb_width; }
+    if (clip_min_y < 0) { clip_min_y = 0; } if (clip_min_y > fb_height) { clip_min_y = fb_height; }
+    if (clip_max_x < 0) { clip_max_x = 0; } if (clip_max_x > fb_width)  { clip_max_x = fb_width; }
+    if (clip_max_y < 0) { clip_max_y = 0; } if (clip_max_y > fb_height) { clip_max_y = fb_height; }
+
+    MTLScissorRect scissorRect;
+    scissorRect.x      = (NSUInteger)clip_min_x;
+    scissorRect.y      = (NSUInteger)clip_min_y;
+    scissorRect.width  = (NSUInteger)(clip_max_x - clip_min_x);
+    scissorRect.height = (NSUInteger)(clip_max_y - clip_min_y);
+    return scissorRect;
+}
+
 // Metal Render function.
 void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> commandEncoder)
 {
@@ -267,25 +295,16 @@ void ImGui_ImplMetal_RenderDrawData(ImDrawData* draw_data, id<MTLCommandBuffer> 
                 // Project scissor/clipping rectangles into framebuffer space
                 ImVec2 clip_min((pcmd->ClipRect.x - clip_off.x) * clip_scale.x, (pcmd->ClipRect.y - clip_off.y) * clip_scale.y);
                 ImVec2 clip_max((pcmd->ClipRect.z - clip_off.x) * clip_scale.x, (pcmd->ClipRect.w - clip_off.y) * clip_scale.y);
-
-                // Clamp to viewport as setScissorRect() won't accept values that are off bounds
-                if (clip_min.x < 0.0f) { clip_min.x = 0.0f; }
-                if (clip_min.y < 0.0f) { clip_min.y = 0.0f; }
-                if (clip_max.x > (float)fb_width) { clip_max.x = (float)fb_width; }
-                if (clip_max.y > (float)fb_height) { clip_max.y = (float)fb_height; }
                 if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y)
                     continue;
                 if (pcmd->ElemCount == 0) // drawIndexedPrimitives() validation doesn't accept this
                     continue;
 
-                // Apply scissor/clipping rectangle
-                MTLScissorRect scissorRect =
-                {
-                    .x = NSUInteger(clip_min.x),
-                    .y = NSUInteger(clip_min.y),
-                    .width = NSUInteger(clip_max.x - clip_min.x),
-                    .height = NSUInteger(clip_max.y - clip_min.y)
-                };
+                // Convert to an integer scissor rectangle, expanding fractional bounds outward
+                // (min floored, max ceiled) so edge pixel ownership matches the OpenGL backends.
+                MTLScissorRect scissorRect = ImGui_ImplMetal_GetScissorRect(clip_min, clip_max, fb_width, fb_height);
+                if (scissorRect.width == 0 || scissorRect.height == 0)
+                    continue;
                 [commandEncoder setScissorRect:scissorRect];
 
                 // Bind texture, Draw

@@ -130,6 +130,15 @@ Other Changes:
 - Backends:
   - DirectX9: pre-transforming vertices and using `D3DFVF_XYZRHW` vertex format, largely
     increasing performances when in `D3DCREATE_SOFTWARE_VERTEXPROCESSING` mode. (#9628)
+  - OpenGL2, OpenGL3, Metal, Metal4: clip rectangles are now converted to integer
+    scissor rectangles by flooring the min boundary and ceiling the max boundary
+    (instead of truncating each value independently), and clamped to the framebuffer.
+    With fractional `FramebufferScale` this guarantees that every covered pixel is
+    included and adjacent clip regions share a consistent edge pixel ownership across
+    all renderers. The draw data itself is left untouched and still carries the
+    original logical clip rectangle.
+  - OpenGL3: fixed scissor rectangle Y inversion being applied even when a
+    `GL_UPPER_LEFT` clip origin is selected via `ImGui_ImplOpenGL3_SetClipOrigin()`.
   - GLFW: allow initialization with missing HWND. (#9619) [@djohansson]
   - GLFW, SDL2: Emscripten implementation of `Platform_OpenInShellFn` calls
     `window.open()` with `noopener`: prevents newly opened tab from keeping a

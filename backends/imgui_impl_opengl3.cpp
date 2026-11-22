@@ -24,6 +24,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2026-11-23: OpenGL: Convert clip rectangles to scissor boxes by flooring the min boundary and ceiling the max boundary, and clamp to the framebuffer, matching the Metal backends so adjacent clip regions have consistent pixel edge ownership at fractional FramebufferScale. Fixed scissor Y inversion when using GL_UPPER_LEFT clip origin.
 //  2026-10-01: OpenGL: Added ImGui_ImplOpenGL3_SetClipOrigin() to specify clip origins (GL_LOWER_LEFT/GL_UPPER_LEFT, or use 0 to autodetect). (#2186, #3998, #3146, #3143, #8640)
 //                      (Breaking): we now default to GL_LOWER_LEFT instead of 0=autodetect. Because 1) detection is not reliable and 2) is slow.
 //  2026-10-01: OpenGL: Avoid querying glGetIntegerv(GL_CLIP_ORIGIN) multiple times when using DrawCallback_ResetRenderState. (#2186, #3998, #3146, #3143, #8640)
@@ -138,6 +139,7 @@
 #include "imgui_impl_opengl3.h"
 #include <stdio.h>
 #include <stdint.h>     // intptr_t
+#include <math.h>       // floorf(), ceilf()
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -467,6 +469,31 @@ void    ImGui_ImplOpenGL3_SetClipOrigin(unsigned int clip_origin)
     bd->ClipOriginRequest = clip_origin;
 }
 
+// Convert a floating point clip rectangle (in framebuffer pixels) to an integer
+// scissor rectangle covering every pixel touched by the clip region.
+// - The min boundary is floored and the max boundary ceiled so that two adjacent
+//   clip regions share the exact same edge pixel ownership (no gap, no double ownership).
+// - The result is clamped to the framebuffer bounds as glScissor() rejects off-bounds rectangles.
+// This mirrors the convention used by the Metal/Metal4 backends so clipping output is identical across renderers.
+static void ImGui_ImplOpenGL3_GetScissorRect(const ImVec2& clip_min_f, const ImVec2& clip_max_f, int fb_width, int fb_height, int scissor[4])
+{
+    int clip_min_x = (int)floorf(clip_min_f.x);
+    int clip_min_y = (int)floorf(clip_min_f.y);
+    int clip_max_x = (int)ceilf(clip_max_f.x);
+    int clip_max_y = (int)ceilf(clip_max_f.y);
+
+    // Clamp to framebuffer as glScissor() won't accept values that are off bounds.
+    if (clip_min_x < 0) { clip_min_x = 0; } if (clip_min_x > fb_width)  { clip_min_x = fb_width; }
+    if (clip_min_y < 0) { clip_min_y = 0; } if (clip_min_y > fb_height) { clip_min_y = fb_height; }
+    if (clip_max_x < 0) { clip_max_x = 0; } if (clip_max_x > fb_width)  { clip_max_x = fb_width; }
+    if (clip_max_y < 0) { clip_max_y = 0; } if (clip_max_y > fb_height) { clip_max_y = fb_height; }
+
+    scissor[0] = clip_min_x;
+    scissor[1] = clip_min_y;
+    scissor[2] = clip_max_x - clip_min_x;
+    scissor[3] = clip_max_y - clip_min_y;
+}
+
 // OpenGL3 Render function.
 // Note that this implementation is little overcomplicated because we are saving/setting up/restoring every OpenGL state explicitly.
 // This is in order to be able to run within an OpenGL engine that doesn't do so.
@@ -611,8 +638,27 @@ void    ImGui_ImplOpenGL3_RenderDrawData(ImDrawData* draw_data)
                 if (clip_max.x <= clip_min.x || clip_max.y <= clip_min.y)
                     continue;
 
-                // Apply scissor/clipping rectangle (Y is inverted in OpenGL)
-                GL_CALL(glScissor((int)clip_min.x, (int)((float)fb_height - clip_max.y), (int)(clip_max.x - clip_min.x), (int)(clip_max.y - clip_min.y)));
+                // Convert to an integer scissor rectangle.
+                // Floating point bounds are expanded outward (min floored, max ceiled) so that
+                // every covered framebuffer pixel is included and adjacent clip regions have a
+                // consistent edge ownership matching the Metal backends.
+                int scissor[4];
+                ImGui_ImplOpenGL3_GetScissorRect(clip_min, clip_max, fb_width, fb_height, scissor);
+                if (scissor[2] <= 0 || scissor[3] <= 0)
+                    continue;
+
+                // Apply scissor/clipping rectangle.
+                // With the default GL_LOWER_LEFT origin the Y axis is inverted in window space.
+                // When GL_UPPER_LEFT is used (glClipControl) the projection matrix is flipped too,
+                // so the scissor rectangle is specified in the same upper-left space as Metal.
+                if (bd->ClipOriginCurrent == GL_UPPER_LEFT)
+                {
+                    GL_CALL(glScissor(scissor[0], scissor[1], scissor[2], scissor[3]));
+                }
+                else
+                {
+                    GL_CALL(glScissor(scissor[0], fb_height - (scissor[1] + scissor[3]), scissor[2], scissor[3]));
+                }
 
                 // Bind texture, Draw
                 GL_CALL(glBindTexture(GL_TEXTURE_2D, (GLuint)(intptr_t)pcmd->GetTexID()));
