@@ -3803,6 +3803,8 @@ void ImTextureData::DestroyPixels()
 //-----------------------------------------------------------------------------
 // - ImFontAtlasBuildSetTexture()
 // - ImFontAtlasBuildUpdateTexData()
+// - ImFontAtlasCanDeferTextureCommit()
+// - ImFontAtlasBuildCommitTexture()
 // - ImFontAtlasTextureAdd()
 // - ImFontAtlasTextureRepack()
 // - ImFontAtlasTextureGrow()
@@ -3992,6 +3994,8 @@ static void ImFontAtlasBuildUpdateRendererHasTexturesFromContext(ImFontAtlas* at
         }
 }
 
+static void ImFontAtlasBuildCommitTexture(ImFontAtlas* atlas);
+
 // Called by NewFrame() for atlases owned by a context.
 // If you manually manage font atlases, you'll need to call this yourself.
 // - 'frame_count' needs to be provided because we can gc/prioritize baked fonts based on their age.
@@ -4000,6 +4004,13 @@ void ImFontAtlasUpdateNewFrame(ImFontAtlas* atlas, int frame_count, bool rendere
 {
     IM_ASSERT(atlas->Builder == NULL || atlas->Builder->FrameCount < frame_count); // Protection against being called twice.
     atlas->RendererHasTextures = renderer_has_textures;
+
+    // Commit a pending texture replacement once the backend has made the new texture samplable.
+    // Until then, draw lists keep referring to the previous texture along with its matching glyph UVs,
+    // so already-committed text and newly emitted text always use a valid texture+UVs pair.
+    if (atlas->TexData != NULL && atlas->TexData != atlas->TexRef._TexData)
+        if (atlas->TexData->Status == ImTextureStatus_OK || atlas->TexData->Status == ImTextureStatus_WantUpdates)
+            ImFontAtlasBuildCommitTexture(atlas);
 
     // Update texture status and discard old textures.
     // (we do this first thing to handle an edge case: if user mistakenly calls ClearFonts()+SetStatus(OK) during
@@ -5551,7 +5562,9 @@ void ImFontAtlasUpdateDrawListsSharedData(ImFontAtlas* atlas)
         }
 }
 
-// Set current texture. This is mostly called from AddTexture() + to handle a failed resize.
+// Set texture used for drawing: update TexRef/TexUvScale and patch all draw lists accordingly.
+// This is called by ImFontAtlasBuildCommitTexture() when a replacement texture becomes samplable,
+// or right away when we have no samplable fallback to keep drawing with (e.g. first texture, legacy backend).
 static void ImFontAtlasBuildSetTexture(ImFontAtlas* atlas, ImTextureData* tex)
 {
     ImTextureRef old_tex_ref = atlas->TexRef;
@@ -5569,7 +5582,59 @@ static void ImFontAtlasBuildUpdateTexData(ImFontAtlas* atlas)
     ImFontAtlasBuildUpdateTexDataCorners(atlas);
 }
 
-// Create a new texture, discard previous one
+// A texture replacement may only be deferred if the texture currently used for drawing can still be sampled,
+// so that already-committed text and text emitted until the commit keep a matching texture+UVs pair.
+static bool ImFontAtlasCanDeferTextureCommit(ImFontAtlas* atlas)
+{
+    if (!atlas->RendererHasTextures)
+        return false; // Legacy backends provide no creation feedback: always commit right away.
+    ImTextureData* draw_tex = atlas->TexRef._TexData;
+    return draw_tex != NULL && (draw_tex->Status == ImTextureStatus_OK || draw_tex->Status == ImTextureStatus_WantUpdates);
+}
+
+// Commit a texture replacement: start drawing with the latest texture and discard superseded ones.
+// ImFontAtlasTextureRepack() builds the new texture and its new layout immediately, but calling this is
+// deferred until the backend confirms the new texture can be sampled (ImTextureStatus_OK), so that:
+// - text already committed and text emitted meanwhile keep using the previous texture with matching glyph UVs;
+// - if the backend cannot create the new texture yet (e.g. transient upload failure), the previous atlas
+//   keeps displaying existing text, and packing resumes into the pending texture until the backend recovers.
+static void ImFontAtlasBuildCommitTexture(ImFontAtlas* atlas)
+{
+    ImTextureData* new_tex = atlas->TexData;
+    IM_ASSERT(new_tex != NULL);
+    ImFontAtlasBuilder* builder = atlas->Builder;
+    IMGUI_DEBUG_LOG_FONT("[font] Texture #%03d: commit %dx%d\n", new_tex->UniqueID, new_tex->Width, new_tex->Height);
+
+    // Switch texture used for drawing and update all draw lists (textures pushed by user are left untouched)
+    ImFontAtlasBuildSetTexture(atlas, new_tex);
+
+    if (builder != NULL)
+    {
+        // Patch glyphs UV to match the new texture layout
+        for (int baked_n = 0; baked_n < builder->BakedPool.Size; baked_n++)
+            for (ImFontGlyph& glyph : builder->BakedPool[baked_n].Glyphs)
+                if (glyph.PackId != ImFontAtlasRectId_Invalid)
+                {
+                    ImTextureRect* r = ImFontAtlasPackGetRect(atlas, glyph.PackId);
+                    glyph.U0 = (r->x) * atlas->TexUvScale.x;
+                    glyph.V0 = (r->y) * atlas->TexUvScale.y;
+                    glyph.U1 = (r->x + r->w) * atlas->TexUvScale.x;
+                    glyph.V1 = (r->y + r->h) * atlas->TexUvScale.y;
+                }
+
+        // Update other cached UV
+        ImFontAtlasBuildUpdateTexData(atlas);
+        ImFontAtlasUpdateDrawListsSharedData(atlas);
+    }
+
+    // Queue superseded textures for destruction: they are not needed anymore now that the new one is samplable.
+    for (ImTextureData* old_tex : atlas->TexList)
+        if (old_tex != new_tex && !old_tex->WantDestroyNextFrame)
+            old_tex->WantDestroyNextFrame = true;
+}
+
+// Create a new texture and make it the builder target (atlas->TexData).
+// The texture used for drawing (atlas->TexRef) is only switched by ImFontAtlasBuildCommitTexture().
 ImTextureData* ImFontAtlasTextureAdd(ImFontAtlas* atlas, int w, int h)
 {
     ImTextureData* old_tex = atlas->TexData;
@@ -5594,15 +5659,17 @@ ImTextureData* ImFontAtlasTextureAdd(ImFontAtlas* atlas, int w, int h)
     }
     if (old_tex != NULL)
     {
-        // Queue old as to destroy next frame
-        old_tex->WantDestroyNextFrame = true;
+        // Queue old as to destroy.
+        // - A texture which never became samplable (never reached the backend) can be discarded right away.
+        // - A samplable texture is kept as a fallback until the new texture is committed (see ImFontAtlasBuildCommitTexture()).
+        if (old_tex->Status != ImTextureStatus_OK && old_tex->Status != ImTextureStatus_WantUpdates)
+            old_tex->WantDestroyNextFrame = true;
         IM_ASSERT(old_tex->Status == ImTextureStatus_OK || old_tex->Status == ImTextureStatus_WantCreate || old_tex->Status == ImTextureStatus_WantUpdates);
     }
 
     new_tex->Create(atlas->TexDesiredFormat, w, h);
     atlas->TexIsBuilt = false;
-
-    ImFontAtlasBuildSetTexture(atlas, new_tex);
+    atlas->TexData = new_tex; // New texture becomes the builder target, atlas->TexRef keeps pointing to the texture used for drawing.
 
     return new_tex;
 }
@@ -5658,7 +5725,9 @@ void ImFontAtlasTextureRepack(ImFontAtlas* atlas, int w, int h)
             new_tex->WantDestroyNextFrame = true;
             builder->Rects.swap(old_rects);
             builder->RectsIndex = old_index;
-            ImFontAtlasBuildSetTexture(atlas, old_tex);
+            atlas->TexData = old_tex;               // Restore builder target (the texture used for drawing was never switched)
+            old_tex->WantDestroyNextFrame = false;  // Undo destroy queued by ImFontAtlasTextureAdd()
+            builder->LockDisableResize = false;
             ImFontAtlasTextureGrow(atlas, w, h); // Recurse
             return;
         }
@@ -5670,23 +5739,12 @@ void ImFontAtlasTextureRepack(ImFontAtlas* atlas, int w, int h)
     builder->RectsDiscardedCount = 0;
     builder->RectsDiscardedSurface = 0;
 
-    // Patch glyphs UV
-    for (int baked_n = 0; baked_n < builder->BakedPool.Size; baked_n++)
-        for (ImFontGlyph& glyph : builder->BakedPool[baked_n].Glyphs)
-            if (glyph.PackId != ImFontAtlasRectId_Invalid)
-            {
-                ImTextureRect* r = ImFontAtlasPackGetRect(atlas, glyph.PackId);
-                glyph.U0 = (r->x) * atlas->TexUvScale.x;
-                glyph.V0 = (r->y) * atlas->TexUvScale.y;
-                glyph.U1 = (r->x + r->w) * atlas->TexUvScale.x;
-                glyph.V1 = (r->y + r->h) * atlas->TexUvScale.y;
-            }
-
-    // Update other cached UV
-    ImFontAtlasBuildUpdateTexData(atlas);
-
     builder->LockDisableResize = false;
-    ImFontAtlasUpdateDrawListsSharedData(atlas);
+
+    // Start drawing with the new texture and layout right away, unless we can keep using the previous
+    // texture as a fallback until the backend makes the new one samplable (deferred to ImFontAtlasUpdateNewFrame()).
+    if (!ImFontAtlasCanDeferTextureCommit(atlas))
+        ImFontAtlasBuildCommitTexture(atlas);
     //ImFontAtlasDebugWriteTexToDisk(new_tex, "After Pack");
 }
 
@@ -5782,6 +5840,10 @@ void ImFontAtlasBuildClear(ImFontAtlas* atlas)
     for (ImFont* font : atlas->Fonts)
         for (ImFontConfig* src : font->Sources)
             ImFontAtlasFontSourceAddToFont(atlas, font, src);
+
+    // All cached glyphs were discarded, so the previous texture is of no use as a fallback: commit right away.
+    if (atlas->TexRef._TexData != atlas->TexData)
+        ImFontAtlasBuildCommitTexture(atlas);
 }
 
 // You should not need to call this manually!
@@ -5841,6 +5903,10 @@ void ImFontAtlasBuildInit(ImFontAtlas* atlas)
     ImFontAtlasUpdateDrawListsSharedData(atlas);
 
     //atlas->TexIsBuilt = true;
+
+    // Start drawing with the new texture right away when we have no samplable fallback (e.g. first texture, legacy backend)
+    if (!ImFontAtlasCanDeferTextureCommit(atlas))
+        ImFontAtlasBuildCommitTexture(atlas);
 
     // Lazily initialize char/text classifier
     // FIXME: This could be practically anywhere, and should eventually be parameters to CalcTextSize/word-wrapping code, but there's no obvious spot now.

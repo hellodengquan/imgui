@@ -65,6 +65,13 @@ Autumn cleanup of stuff marked obsolete more than two years ago:
 
 Other Changes:
 
+- Fonts: (dynamic font atlas) Defer switching draw lists to a replacement texture until the
+  backend confirms it can be sampled. Previously, when the atlas grew, draw lists and glyph UVs
+  were switched to the new layout immediately and the previous texture was queued for destruction
+  right away. If the backend could not create the new texture yet (e.g. transient upload failure),
+  text could not be displayed anymore. Now the previous texture keeps being used until the new one
+  is samplable, and is only destroyed afterwards, so existing text keeps displaying during upload
+  failures and glyph packing transparently resumes once the backend recovers.
 - Style:
   - `StyleColorsDark()`: tweaked WindowBg, PopupBg, ChildBg to be darker than in 1.93.0.
   - Added `style.SymbolArrowSizeFactor`, `style.SymbolArrowThicknessFactor` to tweak the
