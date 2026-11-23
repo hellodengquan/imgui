@@ -4083,18 +4083,37 @@ void ImGui::TableLoadSettingsForColumns(ImGuiTable* table)
                     break;
                 }
 
-    // Remaining entries are matched sequentially
+    // Remaining entries are matched sequentially.
+    // Distinguish two generations of layout data:
+    // - Legacy .ini data has no column identifiers at all (every entry ID == 0). It carries no
+    //   identity information, so entries are restored purely by position, preserving the behavior
+    //   of layout files written before column IDs were saved.
+    // - Modern data has at least one stable column ID. An entry that could not be matched by
+    //   identity above is an orphan from a removed column when it carries an ID, and must NOT be
+    //   paired by position: otherwise a brand-new column would wrongly inherit the removed
+    //   column's layout instead of following the panel-declared default layout. ID-less entries
+    //   (label-less columns) may still fall back onto ID-less live columns by position.
+    bool has_any_settings_id = false;
+    for (int n = settings_start_n; n < settings->ColumnsCount; n++)
+        if (column_settings[n].ID != 0)
+        {
+            has_any_settings_id = true;
+            break;
+        }
     int dst_idx = 0;
     for (int n = settings_start_n; n < settings->ColumnsCount; n++)
-        if (!column_settings[n].IsLoaded)
-        {
-            while (dst_idx < table->ColumnsCount && table->Columns[dst_idx].IsLoadedSettings)
-                dst_idx++;
-            if (dst_idx >= table->ColumnsCount)
-                break;
-            TableLoadSettingsForColumn(&table->Columns[dst_idx], &column_settings[n], settings->SaveFlags);
+    {
+        if (column_settings[n].IsLoaded)
+            continue;
+        if (has_any_settings_id && column_settings[n].ID != 0) // Orphaned entry of a removed column.
+            continue;
+        while (dst_idx < table->ColumnsCount && (table->Columns[dst_idx].IsLoadedSettings || (has_any_settings_id && table->Columns[dst_idx].ID != 0)))
             dst_idx++;
-        }
+        if (dst_idx >= table->ColumnsCount)
+            break;
+        TableLoadSettingsForColumn(&table->Columns[dst_idx], &column_settings[n], settings->SaveFlags);
+        dst_idx++;
+    }
 }
 
 void ImGui::TableLoadSettingsForColumn(ImGuiTableColumn* column, ImGuiTableColumnSettings* column_settings, ImGuiTableFlags load_flags)
